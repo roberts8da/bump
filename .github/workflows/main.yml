@@ -2,195 +2,83 @@ name: Katabump Auto Renew
 
 on:
   schedule:
-    - cron: '0 8 */3 * *'
-  workflow_dispatch: # 允许手动触发
+  - cron: '0 2 */3 * *'  # 每 3 天一次 (UTC 2点 = 北京时间 10点),定时自主续期
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 签到平台任务 id (手动触发可留空)
+        required: false
+        type: string
+      run_id:
+        description: 签到平台运行 id (手动触发可留空)
+        required: false
+        type: string
+      callback_url:
+        description: 签到平台回调地址 (可选,默认官方 worker)
+        required: false
+        type: string
+      skip_webhook:
+        description: 跳过签到平台 webhook 回调 (手动调试用)
+        required: false
+        type: boolean
+        default: false
 
 jobs:
-  renew:
+  Renew-Katabump:
     runs-on: ubuntu-latest
+    permissions:
+      actions: write  
+      contents: read
     
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
+    - uses: actions/checkout@v6
+    - name: ⚙ 设置 Python
+      uses: actions/setup-python@v6
       with:
-        node-version: '20'
-        
-    - name: Install System Dependencies
+        python-version: '3.12'
+
+    - name: 🛠️ 安装系统依赖和python依赖
       run: |
         sudo apt-get update
-        sudo apt-get install -y xvfb curl jq
-        
-    - name: Install Project Dependencies
-      # 移除了原有的 npx playwright install 等步骤，直接让 npm install 完成配置即可
-      run: |
-        npm install
+        sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
+        pip install seleniumbase requests
+        seleniumbase install chromedriver
 
-    - name: Setup and Run Xray (Robust VLESS to Socks5)
+    - name: ⚙ 设置代理 (sing-box)
+      continue-on-error: true
       env:
-        HTTP_PROXY_RAW: ${{ secrets.HTTP_PROXY }}
+        NODE_LINK: ${{ secrets.NODE_LINK }}
       run: |
-        echo "正在下载并安装 Xray-core..."
-        curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/download/v25.9.11/Xray-linux-64.zip
-        unzip -q xray.zip -d xray-bin
-        chmod +x ./xray-bin/xray
-        
-        echo "正在使用 Node.js 精准解析 VLESS 并生成配置..."
-        node -e '
-        try {
-          const raw = process.env.HTTP_PROXY_RAW;
-          if (!raw) throw new Error("未检测到 HTTP_PROXY 变量");
+        bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-          const urlObj = new URL(raw);
-          const uuid = decodeURIComponent(urlObj.username);
-          // 兼容 IPv6 地址（形如 [::1]）
-          const server = urlObj.hostname.replace(/^\[|\]$/g, "");
-          const port = parseInt(urlObj.port);
-          if (!uuid || !server || !port) throw new Error("VLESS 链接缺少必要字段 (uuid/server/port)");
-
-          const params = urlObj.searchParams;
-
-          // 传输层协议，默认为 tcp（原始 VLESS 标准默认值）
-          const network = (params.get("type") || "tcp").toLowerCase();
-
-          // 安全层，默认为 none
-          const security = (params.get("security") || "none").toLowerCase();
-
-          // sni 优先，其次 host，最后回退到服务器地址本身
-          const sni = params.get("sni") || params.get("host") || server;
-
-          // TLS 指纹，默认 chrome，兼容 fp 参数
-          const fp = params.get("fp") || "chrome";
-
-          // insecure / allowInsecure 两种参数名都兼容，值为 "1"/"true" 时代表跳过证书校验
-          const insecureRaw = (params.get("allowInsecure") || params.get("insecure") || "0").toLowerCase();
-          const allowInsecure = (insecureRaw === "1" || insecureRaw === "true");
-
-          // ws / http 传输用到的 host 头
-          const hostHeader = params.get("host") || "";
-
-          // path 参数，自动补齐前导 / 并做 URL 解码
-          let pathStr = params.get("path") || "/";
-          pathStr = decodeURIComponent(pathStr);
-          if (!pathStr.startsWith("/")) pathStr = "/" + pathStr;
-
-          // tcp 伪装类型：none（原始 TCP）或 http（HTTP 伪装）
-          const headerType = (params.get("headerType") || "none").toLowerCase();
-
-          const streamSettings = {
-            "network": network,
-            "security": security
-          };
-
-          if (security === "tls") {
-            streamSettings.tlsSettings = {
-              "serverName": sni,
-              "allowInsecure": allowInsecure,
-              "fingerprint": fp
-            };
-          } else if (security === "reality") {
-            streamSettings.realitySettings = {
-              "serverName": sni,
-              "fingerprint": fp,
-              "publicKey": params.get("pbk") || "",
-              "shortId": params.get("sid") || "",
-              "spiderX": params.get("spx") || ""
-            };
-          }
-
-          if (network === "ws") {
-            streamSettings.wsSettings = {
-              "path": pathStr,
-              "headers": hostHeader ? { "Host": hostHeader } : {}
-            };
-          } else if (network === "tcp") {
-            streamSettings.tcpSettings = {
-              "header": { "type": headerType }
-            };
-          } else if (network === "grpc") {
-            streamSettings.grpcSettings = {
-              "serviceName": params.get("serviceName") || pathStr.replace(/^\//, "")
-            };
-          } else if (network === "http" || network === "h2") {
-            streamSettings.network = "http";
-            streamSettings.httpSettings = {
-              "path": pathStr,
-              "host": hostHeader ? [hostHeader] : []
-            };
-          }
-
-          const config = {
-            "log": { "loglevel": "warning" },
-            "inbounds": [
-              {
-                "port": 10808,
-                "protocol": "socks",
-                "settings": { "auth": "noauth", "udp": true }
-              }
-            ],
-            "outbounds": [
-              {
-                "protocol": "vless",
-                "settings": {
-                  "vnext": [
-                    {
-                      "address": server,
-                      "port": port,
-                      "users": [
-                        { "id": uuid, "encryption": "none", "level": 0 }
-                      ]
-                    }
-                  ]
-                },
-                "streamSettings": streamSettings
-              }
-            ]
-          };
-
-          require("fs").writeFileSync("config.json", JSON.stringify(config, null, 2));
-          console.log("✅ config.json 配置文件生成成功！(network=" + network + ", security=" + security + ")");
-        } catch (e) {
-          console.error("❌ 解析 VLESS 失败:", e.message);
-          process.exit(1);
-        }
-        '
-
-        echo "正在后台启动 Xray 代理服务..."
-        ./xray-bin/xray -config config.json > xray.log 2>&1 &
-        
-        echo "等待代理通道建立..."
-        sleep 5
-        
-        echo "=== 正在检查本地 10808 端口占用情况 ==="
-        ss -lntp | grep 10808 || echo "警告: 10808 端口似乎没有被监听！"
-        
-        echo "=== 尝试打印 Xray 运行日志 ==="
-        cat xray.log || true
-
-        echo "=== 校验代理是否真正可用 ==="
-        if ! ss -lntp | grep -q 10808; then
-          echo "❌ Xray 未能监听 10808 端口，代理未启动成功，终止工作流。"
-          exit 1
-        fi
-        if ! curl -s --max-time 10 -x socks5://127.0.0.1:10808 -o /dev/null -w "%{http_code}" https://www.google.com | grep -q "200\|301\|302"; then
-          echo "❌ 代理无法正常访问外网，请检查 HTTP_PROXY 密钥中的 VLESS 节点是否有效。"
-          exit 1
-        fi
-        echo "✅ 代理连通性检测通过！"
-
-    - name: Run Renew Script
+    - name: 🚀 运行续期脚本
       env:
         USERS_JSON: ${{ secrets.USERS_JSON }}
-        SERVER_URL: ${{ secrets.SERVER_URL }}
+        KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
+        KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        HTTP_PROXY: "socks5://127.0.0.1:10808"
-      run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action_renew.js
-
-    - name: Upload Screenshots
+        # 签到平台回调 (cron 定时触发自动跳过,平台/手动触发时上报)
+        JOB_ID: ${{ github.event.inputs.job_id || 'katabump-renew' }}
+        RUN_ID: ${{ github.event.inputs.run_id || '' }}
+        CALLBACK_URL: ${{ github.event.inputs.callback_url || 'https://checkin-cron-worker.wwwqqq001.workers.dev/webhook/checkin' }}
+        WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+        SKIP_WEBHOOK: ${{ github.event_name == 'schedule' && 'true' || (github.event.inputs.skip_webhook || 'false') }}
+      run: |
+        xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+          python3 app.py
+        
+    - name: 🧹 清理旧的工作流运行记录
       if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: screenshots
-        path: screenshots/
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+        count=0
+        for run_id in $runs; do
+          count=$((count + 1))
+          if [ $count -gt 1 ]; then
+            echo "删除运行记录: $run_id"
+            gh run delete $run_id || true
+          fi
+        done
